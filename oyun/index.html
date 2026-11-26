@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'">
+<title>Çiftçi Koşusu</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #1d2433; color: #fff; font-family: system-ui, sans-serif; overflow: hidden; touch-action: none; user-select: none; -webkit-user-select: none; }
+  #wrap { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; }
+  canvas { width: 100%; max-width: 960px; image-rendering: pixelated; background: #8fd3ff; }
+  #touch { display: flex; justify-content: space-between; width: 100%; max-width: 960px; padding: 12px 16px; box-sizing: border-box; }
+  #touch div { display: flex; gap: 12px; }
+  #touch button { width: 72px; height: 72px; border-radius: 50%; border: 0; background: rgba(255,255,255,.2); color: #fff; font-size: 28px; }
+  @media (hover: hover) and (pointer: fine) { #touch { display: none; } }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="c" width="640" height="480"></canvas>
+  <div id="touch">
+    <div><button id="bl">◀</button><button id="br">▶</button></div>
+    <div><button id="bj">▲</button></div>
+  </div>
+</div>
+<script>
+"use strict";
+const cv = document.getElementById("c"), ctx = cv.getContext("2d");
+const T = 32, H = 15, W = 160, VW = cv.width, VH = cv.height;
+
+// --- Seviye ---
+let map, enemies, coins, player, camX, score, lives, state, timer;
+
+function buildLevel() {
+  map = Array.from({ length: H }, () => Array(W).fill("."));
+  const set = (x, y, c) => { if (x >= 0 && x < W && y >= 0 && y < H) map[y][x] = c; };
+  const gaps = [[30, 31], [58, 60], [95, 97], [118, 119]];
+  for (let x = 0; x < W; x++) {
+    if (gaps.some(([a, b]) => x >= a && x <= b)) continue;
+    set(x, 13, "#"); set(x, 14, "#");
+  }
+  set(14, 9, "K");
+  for (let x = 19; x <= 23; x++) set(x, 9, x === 21 ? "K" : "B");
+  set(21, 5, "K");
+  for (let x = 38; x <= 42; x++) set(x, 9, "B");
+  set(40, 9, "K");
+  for (let x = 46; x <= 47; x++) for (let y = 11; y <= 12; y++) set(x, y, "B");
+  for (let x = 64; x <= 70; x++) set(x, 8, "B");
+  set(67, 4, "K");
+  for (let x = 76; x <= 79; x++) set(x, 10, "B");
+  for (let x = 84; x <= 87; x++) set(x, 7, "B");
+  for (let x = 102; x <= 104; x++) set(x, 9, "K");
+  for (let i = 0; i < 6; i++) for (let y = 12 - i; y <= 12; y++) set(130 + i, y, "B");
+  for (let y = 6; y <= 12; y++) set(136, y, "B");
+  set(150, 3, "F");
+  for (let y = 4; y <= 12; y++) set(150, y, "|");
+
+  coins = [];
+  const coinRow = (x1, x2, y) => { for (let x = x1; x <= x2; x++) coins.push({ x: x * T + 8, y: y * T + 8, got: false }); };
+  coinRow(19, 23, 7); coinRow(30, 31, 9); coinRow(64, 70, 6); coinRow(84, 87, 5); coinRow(95, 97, 9); coinRow(110, 114, 11);
+
+  enemies = [25, 44, 52, 68, 74, 82, 90, 106, 112, 124].map(x => ({ x: x * T, y: (x === 68 ? 7 : 12) * T, vx: -1, vy: 0, alive: true, squish: 0 }));
+}
+
+function resetPlayer() {
+  player = { x: 3 * T, y: 11 * T, w: 24, h: 30, vx: 0, vy: 0, onGround: false, face: 1, inv: 0 };
+  camX = 0;
+}
+
+function newGame() {
+  score = 0; lives = 3; buildLevel(); resetPlayer(); state = "play"; timer = 0;
+}
+
+// --- Girdi ---
+const keys = { left: false, right: false, jump: false };
+const keyMap = { ArrowLeft: "left", KeyA: "left", ArrowRight: "right", KeyD: "right", ArrowUp: "jump", KeyW: "jump", Space: "jump" };
+addEventListener("keydown", e => {
+  if (keyMap[e.code]) { keys[keyMap[e.code]] = true; e.preventDefault(); }
+  if (e.code === "Enter" && state !== "play") newGame();
+});
+addEventListener("keyup", e => { if (keyMap[e.code]) keys[keyMap[e.code]] = false; });
+for (const [id, k] of [["bl", "left"], ["br", "right"], ["bj", "jump"]]) {
+  const b = document.getElementById(id);
+  b.addEventListener("pointerdown", e => { e.preventDefault(); keys[k] = true; if (state !== "play") newGame(); });
+  for (const ev of ["pointerup", "pointerleave", "pointercancel"]) b.addEventListener(ev, () => { keys[k] = false; });
+}
+cv.addEventListener("pointerdown", () => { if (state !== "play") newGame(); });
+
+// --- Fizik ---
+const solid = c => c === "#" || c === "B" || c === "K" || c === "U";
+const tileAt = (px, py) => {
+  const tx = Math.floor(px / T), ty = Math.floor(py / T);
+  if (tx < 0 || tx >= W) return "#";
+  if (ty < 0 || ty >= H) return ".";
+  return map[ty][tx];
+};
+
+function moveBody(o, isPlayer) {
+  o.x += o.vx;
+  let hitWall = false;
+  for (const yy of [o.y + 1, o.y + o.h / 2, o.y + o.h - 1]) {
+    if (o.vx > 0 && solid(tileAt(o.x + o.w, yy))) { o.x = Math.floor((o.x + o.w) / T) * T - o.w - 0.01; hitWall = true; }
+    if (o.vx < 0 && solid(tileAt(o.x, yy))) { o.x = Math.floor(o.x / T + 1) * T; hitWall = true; }
+  }
+  o.vy = Math.min(o.vy + 0.55, 12);
+  o.y += o.vy;
+  o.onGround = false;
+  for (const xx of [o.x + 2, o.x + o.w - 2]) {
+    if (o.vy > 0 && solid(tileAt(xx, o.y + o.h))) { o.y = Math.floor((o.y + o.h) / T) * T - o.h; o.vy = 0; o.onGround = true; }
+    if (o.vy < 0 && solid(tileAt(xx, o.y))) {
+      const tx = Math.floor(xx / T), ty = Math.floor(o.y / T);
+      o.y = (ty + 1) * T; o.vy = 0;
+      if (isPlayer && map[ty][tx] === "K") { map[ty][tx] = "U"; score += 100; coins.push({ x: tx * T + 8, y: (ty - 1) * T + 8, got: false, pop: 20 }); }
+    }
+  }
+  return hitWall;
+}
+
+const overlap = (a, b) => a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+
+function hurt() {
+  if (player.inv > 0) return;
+  lives--;
+  if (lives <= 0) { state = "over"; return; }
+  resetPlayer(); player.inv = 90;
+}
+
+function update() {
+  if (state !== "play") return;
+  timer++;
+  const p = player;
+  const acc = p.onGround ? 0.6 : 0.35;
+  if (keys.left) { p.vx -= acc; p.face = -1; }
+  if (keys.right) { p.vx += acc; p.face = 1; }
+  if (!keys.left && !keys.right) p.vx *= p.onGround ? 0.8 : 0.95;
+  p.vx = Math.max(-4.5, Math.min(4.5, p.vx));
+  if (keys.jump && p.onGround) { p.vy = -11.5; p.onGround = false; }
+  if (!keys.jump && p.vy < -4) p.vy = -4; // kısa zıplama
+  moveBody(p, true);
+  if (p.x < camX) { p.x = camX; p.vx = 0; }
+  if (p.inv > 0) p.inv--;
+  if (p.y > H * T) { player.inv = 0; hurt(); return; }
+
+  camX = Math.max(camX, Math.min(p.x - VW * 0.4, W * T - VW));
+
+  for (const c of coins) {
+    if (c.pop) { c.pop--; c.y -= 2; if (!c.pop) c.got = true; continue; }
+    if (!c.got && overlap(p, { x: c.x, y: c.y, w: 16, h: 16 })) { c.got = true; score += 50; }
+  }
+
+  for (const e of enemies) {
+    if (!e.alive) { if (e.squish > 0) e.squish--; continue; }
+    if (e.x > camX + VW + 64) continue; // ekrana girmeden hareket etme
+    e.w = 28; e.h = 28;
+    const ahead = e.vx > 0 ? e.x + e.w + 1 : e.x - 1;
+    if (moveBody(e, false) || (e.onGround && !solid(tileAt(ahead, e.y + e.h + 4)))) e.vx = -e.vx;
+    if (e.y > H * T) { e.alive = false; continue; }
+    if (overlap(p, e)) {
+      if (p.vy > 0 && p.y + p.h - p.vy <= e.y + 6) {
+        e.alive = false; e.squish = 30; p.vy = -8; score += 200;
+      } else hurt();
+    }
+  }
+
+  if (p.x + p.w >= 150 * T) { state = "win"; score += lives * 500; }
+}
+
+// --- Çizim ---
+function drawBg() {
+  const g = ctx.createLinearGradient(0, 0, 0, VH);
+  g.addColorStop(0, "#6ec6ff"); g.addColorStop(1, "#c9ecff");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, VW, VH);
+  ctx.fillStyle = "#7cc47a";
+  for (let i = -1; i < 6; i++) {
+    const x = i * 260 - (camX * 0.3) % 260;
+    ctx.beginPath(); ctx.ellipse(x + 130, 420, 160, 110, 0, Math.PI, 0); ctx.fill();
+  }
+  ctx.fillStyle = "#fff";
+  for (let i = -1; i < 5; i++) {
+    const x = i * 220 - (camX * 0.15) % 220, y = 60 + (i & 1) * 40;
+    ctx.beginPath(); ctx.arc(x, y, 18, 0, 7); ctx.arc(x + 22, y - 8, 22, 0, 7); ctx.arc(x + 46, y, 18, 0, 7); ctx.fill();
+  }
+}
+
+function drawTile(c, x, y) {
+  if (c === "#") {
+    ctx.fillStyle = "#8b5a2b"; ctx.fillRect(x, y, T, T);
+    if (y === 13 * T) { ctx.fillStyle = "#4caf50"; ctx.fillRect(x, y, T, 8); }
+  } else if (c === "B") {
+    ctx.fillStyle = "#c0703a"; ctx.fillRect(x, y, T, T);
+    ctx.strokeStyle = "#7a3f17"; ctx.lineWidth = 2;
+    ctx.strokeRect(x + 1, y + 1, T - 2, T - 2);
+    ctx.beginPath(); ctx.moveTo(x, y + 16); ctx.lineTo(x + T, y + 16); ctx.moveTo(x + 16, y); ctx.lineTo(x + 16, y + 16); ctx.stroke();
+  } else if (c === "K" || c === "U") {
+    ctx.fillStyle = c === "K" ? "#3fa7d6" : "#7a7a7a"; ctx.fillRect(x, y, T, T);
+    ctx.strokeStyle = "#1d3b52"; ctx.lineWidth = 2; ctx.strokeRect(x + 1, y + 1, T - 2, T - 2);
+    if (c === "K") { ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(x + 16, y + 16, 6 + Math.sin(timer / 8), 0, 7); ctx.fill(); }
+  } else if (c === "|") {
+    ctx.fillStyle = "#ddd"; ctx.fillRect(x + 14, y, 4, T);
+  } else if (c === "F") {
+    ctx.fillStyle = "#ddd"; ctx.fillRect(x + 14, y, 4, T);
+    ctx.fillStyle = "#e53935"; ctx.beginPath(); ctx.moveTo(x + 18, y + 2); ctx.lineTo(x + 46, y + 12); ctx.lineTo(x + 18, y + 22); ctx.fill();
+  }
+}
+
+function drawPlayer() {
+  const p = player;
+  if (p.inv > 0 && (p.inv >> 2) & 1) return;
+  const x = Math.round(p.x - camX), y = Math.round(p.y);
+  ctx.fillStyle = "#1e5aa8"; ctx.fillRect(x + 3, y + 14, 18, 12);         // tulum
+  ctx.fillStyle = "#4a2c12"; ctx.fillRect(x + 3, y + 26, 7, 4); ctx.fillRect(x + 14, y + 26, 7, 4); // bot
+  ctx.fillStyle = "#f2c49b"; ctx.fillRect(x + 5, y + 4, 14, 10);          // yüz
+  ctx.fillStyle = "#000"; ctx.fillRect(x + (p.face > 0 ? 14 : 7), y + 7, 3, 3); // göz
+  ctx.fillStyle = "#e8c547"; ctx.fillRect(x - 1, y + 2, 26, 3); ctx.fillRect(x + 4, y - 3, 16, 6); // hasır şapka
+}
+
+function drawEnemy(e) {
+  const x = Math.round(e.x - camX), y = Math.round(e.y);
+  if (!e.alive) {
+    if (e.squish > 0) { ctx.fillStyle = "#6a1b9a"; ctx.fillRect(x, y + 22, 28, 6); }
+    return;
+  }
+  ctx.fillStyle = "#7b1fa2"; ctx.beginPath(); ctx.ellipse(x + 14, y + 16, 14, 12, 0, Math.PI, 0); ctx.fill();
+  ctx.fillRect(x, y + 16, 28, 6);
+  ctx.fillStyle = "#222"; const leg = (timer >> 3) & 1;
+  ctx.fillRect(x + 3 + leg * 2, y + 22, 5, 6); ctx.fillRect(x + 20 - leg * 2, y + 22, 5, 6);
+  ctx.fillStyle = "#fff"; ctx.fillRect(x + (e.vx < 0 ? 5 : 17), y + 10, 6, 6);
+  ctx.fillStyle = "#000"; ctx.fillRect(x + (e.vx < 0 ? 5 : 20), y + 12, 3, 3);
+}
+
+function text(s, x, y, size, align) {
+  ctx.font = `bold ${size}px system-ui, sans-serif`; ctx.textAlign = align || "left";
+  ctx.fillStyle = "#000"; ctx.fillText(s, x + 2, y + 2);
+  ctx.fillStyle = "#fff"; ctx.fillText(s, x, y);
+}
+
+function draw() {
+  drawBg();
+  const x0 = Math.floor(camX / T), x1 = Math.min(W - 1, x0 + Math.ceil(VW / T) + 1);
+  for (let ty = 0; ty < H; ty++) for (let tx = x0; tx <= x1; tx++) drawTile(map[ty][tx], Math.round(tx * T - camX), ty * T);
+  ctx.fillStyle = "#ffd600";
+  for (const c of coins) if (!c.got && c.x > camX - 20 && c.x < camX + VW) {
+    ctx.beginPath(); ctx.ellipse(c.x - camX + 8, c.y + 8, 4 + 4 * Math.abs(Math.cos(timer / 10)), 8, 0, 0, 7); ctx.fill();
+  }
+  for (const e of enemies) drawEnemy(e);
+  drawPlayer();
+  text(`PUAN ${score}`, 16, 32, 20);
+  text(`CAN ${"♥".repeat(Math.max(lives, 0))}`, VW - 16, 32, 20, "right");
+  if (state === "over") { text("OYUN BİTTİ", VW / 2, VH / 2, 48, "center"); text("Yeniden başlamak için Enter / dokun", VW / 2, VH / 2 + 40, 18, "center"); }
+  if (state === "win") { text("TEBRİKLER!", VW / 2, VH / 2, 48, "center"); text(`Puan: ${score} — Tekrar için Enter / dokun`, VW / 2, VH / 2 + 40, 18, "center"); }
+}
+
+// Sabit adım: yüksek yenileme hızlı ekranlarda oyun hızlanmasın
+let last = 0, acc = 0;
+function loop(t) {
+  acc += Math.min(t - last, 100); last = t;
+  while (acc >= 1000 / 60) { update(); acc -= 1000 / 60; }
+  draw(); requestAnimationFrame(loop);
+}
+newGame();
+requestAnimationFrame(t => { last = t; loop(t); });
+</script>
+</body>
+</html>
